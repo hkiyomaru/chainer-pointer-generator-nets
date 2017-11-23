@@ -1,5 +1,6 @@
 """Train a seq2seq model."""
 import argparse
+import copy
 
 from nltk.translate import bleu_score
 import numpy
@@ -94,6 +95,34 @@ def load_vocabulary(path):
     return word_ids
 
 
+def read_data(paths):
+    words = []
+    for path in paths:
+        with open(path) as f:
+            words.extend([w for line in f for w in line.strip().split()])
+    return words
+
+
+def make_vocabulary_with_source_side_unks(source_paths, source_vocabulary,
+                                          target_vocabulary):
+    source_ids_with_unks = copy.deepcopy(source_vocabulary)
+    target_ids_with_unks = copy.deepcopy(target_vocabulary)
+    source_ids_to_target_ids = {}
+
+    sources = read_data(source_paths)
+
+    for word in sources:
+        if word not in source_ids_with_unks:
+            source_ids_with_unks[word] = len(source_ids_with_unks)
+    for word in source_ids_with_unks.keys():
+        if word not in target_ids_with_unks:
+            target_ids_with_unks[word] = len(target_ids_with_unks)
+    for k, v in source_ids_with_unks.items():
+        source_ids_to_target_ids[v] = target_ids_with_unks[k]
+
+    return source_ids_with_unks, target_ids_with_unks, source_ids_to_target_ids
+
+
 def load_data(vocabulary, path):
     n_lines = count_lines(path)
     bar = progressbar.ProgressBar()
@@ -158,8 +187,15 @@ def main():
 
     source_ids = load_vocabulary(args.SOURCE_VOCAB)
     target_ids = load_vocabulary(args.TARGET_VOCAB)
-    train_source = load_data(source_ids, args.SOURCE)
-    train_target = load_data(target_ids, args.TARGET)
+
+    source_ids_with_unks, target_ids_with_unks, source_ids_to_target_ids = \
+        make_vocabulary_with_source_side_unks(
+            [args.SOURCE, args.validation_source],
+            source_ids, target_ids
+        )
+
+    train_source = load_data(source_ids_with_unks, args.SOURCE)
+    train_target = load_data(target_ids_with_unks, args.TARGET)
     assert len(train_source) == len(train_target)
     train_data = [(s, t)
                   for s, t in six.moves.zip(train_source, train_target)
