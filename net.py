@@ -290,10 +290,7 @@ class AttentionModule(chainer.Chain):
 
         def compute_context(previous_state):
             decoder_factor = F.broadcast_to(
-                F.reshape(
-                    self.s(previous_state),
-                    (batch_size, 1, self.n_attention_units)
-                ),
+                self.s(previous_state)[:, None, :],
                 (batch_size, max_length, self.n_attention_units)
             )
 
@@ -350,17 +347,23 @@ class PointerModule(chainer.Chain):
             (batch_size, self.n_vocab)
         )
 
-        txs_mask = self.xp.zeros((batch_size, max_length, self.n_vocab), 'f')
+        mask_for_attentions = txs.copy().astype('f')
+        mask_for_attentions[mask_for_attentions >= 0] = 1
+        # set minus-infinite to ignore the element during calculating softmax
+        mask_for_attentions[mask_for_attentions < 0] = -float('inf')
+        masked_attentions = F.softmax(mask_for_attentions * attentions)
+
+        reshaped_txs = self.xp.zeros(
+            (batch_size, max_length, self.n_vocab), 'f'
+        )
         for i, tx in enumerate(self.xp.split(txs, batch_size)):
             masked_tx = tx[tx != PAD]
-            txs_mask[i][self.xp.arange(masked_tx.shape[0]), masked_tx] = 1.0
+            reshaped_txs[i][self.xp.arange(len(masked_tx)), masked_tx] = 1.0
+
         pointer = F.softmax(
             F.sum(
-                txs_mask * F.broadcast_to(
-                    F.reshape(
-                        attentions,
-                        (batch_size, max_length, 1)
-                    ),
+                reshaped_txs * F.broadcast_to(
+                    masked_attentions[:, :, None],
                     (batch_size, max_length, self.n_vocab)
                 ),
                 axis=1
