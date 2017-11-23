@@ -174,7 +174,7 @@ class Decoder(chainer.Chain):
         """
         batch_size, max_length, encoder_output_size = hxs.shape
 
-        compute_context = self.attention(hxs)
+        compute_context = self.attention(hxs, txs)
         # initial cell state
         c = Variable(self.xp.zeros((batch_size, self.n_units), 'f'))
         # initial hidden state
@@ -216,7 +216,7 @@ class Decoder(chainer.Chain):
 
         """
         batch_size, _, _ = hxs.shape
-        compute_context = self.attention(hxs)
+        compute_context = self.attention(hxs, txs)
         c = Variable(self.xp.zeros((batch_size, self.n_units), 'f'))
         h = F.broadcast_to(self.bos_state, ((batch_size, self.n_units)))
         # first character's embedding
@@ -266,7 +266,7 @@ class AttentionModule(chainer.Chain):
         self.n_encoder_output_units = n_encoder_output_units
         self.n_attention_units = n_attention_units
 
-    def __call__(self, hxs):
+    def __call__(self, hxs, xs):
         """Returns a function that calculates context given decoder's state.
 
         Args:
@@ -287,6 +287,9 @@ class AttentionModule(chainer.Chain):
             ),
             (batch_size, max_length, self.n_attention_units)
         )
+        mask_for_attention = xs.copy().astype('f')
+        mask_for_attention[mask_for_attention >= 0] = 0
+        mask_for_attention[mask_for_attention < 0] = -float('inf')
 
         def compute_context(previous_state):
             decoder_factor = F.broadcast_to(
@@ -294,23 +297,22 @@ class AttentionModule(chainer.Chain):
                 (batch_size, max_length, self.n_attention_units)
             )
 
-            attention = F.softmax(
-                F.reshape(
-                    self.o(
-                        F.reshape(
-                            F.tanh(encoder_factor + decoder_factor),
-                            (batch_size * max_length, self.n_attention_units)
-                        )
-                    ),
-                    (batch_size, max_length)
-                )
+            attention = F.reshape(
+                self.o(
+                    F.reshape(
+                        F.tanh(encoder_factor + decoder_factor),
+                        (batch_size * max_length, self.n_attention_units)
+                    )
+                ),
+                (batch_size, max_length)
             )
+            masked_attention = F.softmax(mask_for_attention + attention)
 
             context = F.reshape(
-                F.batch_matmul(attention, hxs, transa=True),
+                F.batch_matmul(masked_attention, hxs, transa=True),
                 (batch_size, encoder_output_size)
             )
-            return context, attention
+            return context, masked_attention
 
         return compute_context
 
@@ -325,13 +327,13 @@ class PointerModule(chainer.Chain):
             self.w = L.Linear(n_decoder_units, 1)
         self.n_vocab = n_vocab
 
-    def __call__(self, context, state, embedding, txs, attentions, o):
+    def __call__(self, context, state, embedding, txs, attention, o):
         """Returns a function that calculates context given decoder's state.
 
         Args:
             txs: Source sequences' word ids represented by target-side
                 vocabulary ids.
-            attentions: The attentions for source sequences.
+            attention: The attention for source sequences.
             os: Decoder's output.
             pgen: Weight to balance the probability of generating words from
                 the vocabulary, versus copying words from the source text.
@@ -347,12 +349,6 @@ class PointerModule(chainer.Chain):
             (batch_size, self.n_vocab)
         )
 
-        mask_for_attentions = txs.copy().astype('f')
-        mask_for_attentions[mask_for_attentions >= 0] = 1
-        # set minus-infinite to ignore the element during calculating softmax
-        mask_for_attentions[mask_for_attentions < 0] = -float('inf')
-        masked_attentions = F.softmax(mask_for_attentions * attentions)
-
         reshaped_txs = self.xp.zeros(
             (batch_size, max_length, self.n_vocab), 'f'
         )
@@ -360,14 +356,12 @@ class PointerModule(chainer.Chain):
             masked_tx = tx[tx != PAD]
             reshaped_txs[i][self.xp.arange(len(masked_tx)), masked_tx] = 1.0
 
-        pointer = F.softmax(
-            F.sum(
-                reshaped_txs * F.broadcast_to(
-                    masked_attentions[:, :, None],
-                    (batch_size, max_length, self.n_vocab)
-                ),
-                axis=1
-            )
+        pointer = F.sum(
+            reshaped_txs * F.broadcast_to(
+                attention[:, :, None],
+                (batch_size, max_length, self.n_vocab)
+            ),
+            axis=1
         )
 
         generator = F.pad_sequence(F.softmax(o), length=self.n_vocab)
