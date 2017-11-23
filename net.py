@@ -1,4 +1,4 @@
-"""Attention-based seq2seq model."""
+"""Pointer Generator Network model."""
 import numpy as np
 
 import chainer
