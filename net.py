@@ -12,6 +12,12 @@ UNK = 0
 EOS = 1
 
 
+def replace_unknown_tokens_with_unk_id(array, n_vocab):
+    ret = array.copy()
+    ret[ret >= n_vocab] = UNK
+    return ret
+
+
 class Seq2seq(chainer.Chain):
 
     def __init__(self, n_source_vocab, n_target_vocab,
@@ -87,6 +93,7 @@ class Encoder(chainer.Chain):
         with self.init_scope():
             self.embed_x = L.EmbedID(n_vocab, n_units, ignore_label=-1)
             self.bilstm = L.NStepBiLSTM(n_layers, n_units, n_units, dropout)
+        self.n_vocab = n_vocab
 
     def __call__(self, xs):
         """Encode source sequences into the representations.
@@ -100,7 +107,8 @@ class Encoder(chainer.Chain):
         """
         batch_size, max_length = xs.shape
 
-        exs = self.embed_x(xs)
+        sanitated = replace_unknown_tokens_with_unk_id(xs, self.n_vocab)
+        exs = self.embed_x(sanitated)
         exs = F.separate(exs, axis=0)
         masks = self.xp.vsplit(xs != -1, batch_size)
         masked_exs = [ex[mask.reshape((-1, ))] for ex, mask in zip(exs, masks)]
@@ -135,6 +143,7 @@ class Decoder(chainer.Chain):
             self.bos_state = Parameter(
                 initializer=self.xp.random.randn(1, n_units).astype('f')
             )
+        self.n_vocab = n_vocab
         self.n_units = n_units
 
     def __call__(self, ys, hxs):
@@ -162,6 +171,7 @@ class Decoder(chainer.Chain):
 
         os = []
         for y in self.xp.hsplit(ys, ys.shape[1]):
+            y = replace_unknown_tokens_with_unk_id(y, self.n_vocab)
             y = y.reshape((batch_size, ))
             context = compute_context(h)
             concatenated = F.concat((previous_embedding, context))
@@ -205,7 +215,9 @@ class Decoder(chainer.Chain):
             y = F.reshape(F.argmax(logit, axis=1), (batch_size, ))
 
             results.append(y)
-            previous_embedding = self.embed_y(y)
+            previous_embedding = self.embed_y(
+                replace_unknown_tokens_with_unk_id(y.data, self.n_vocab)
+            )
         else:
             results = F.separate(F.transpose(F.vstack(results)), axis=0)
 
