@@ -28,9 +28,10 @@ def seq2seq_pad_concat_convert(xy_batch, device):
         Tuple of Converted array.
 
     """
-    x_seqs, y_seqs = zip(*xy_batch)
+    x_seqs, tx_seqs, y_seqs = zip(*xy_batch)
 
     x_block = convert.concat_examples(x_seqs, device, padding=-1)
+    tx_block = convert.concat_examples(tx_seqs, device, padding=-1)
     y_block = convert.concat_examples(y_seqs, device, padding=-1)
     xp = cuda.get_array_module(x_block)
 
@@ -39,12 +40,17 @@ def seq2seq_pad_concat_convert(xy_batch, device):
     for i_batch, seq in enumerate(x_seqs):
         x_block[i_batch, len(seq)] = EOS
 
+    tx_block = xp.pad(tx_block, ((0, 0), (0, 1)),
+                      'constant', constant_values=PAD)
+    for i_batch, seq in enumerate(tx_seqs):
+        tx_block[i_batch, len(seq)] = EOS
+
     y_out_block = xp.pad(y_block, ((0, 0), (0, 1)),
                          'constant', constant_values=PAD)
     for i_batch, seq in enumerate(y_seqs):
         y_out_block[i_batch, len(seq)] = EOS
 
-    return (x_block, y_out_block)
+    return (x_block, tx_block, y_out_block)
 
 
 class CalculateBleu(chainer.training.Extension):
@@ -66,13 +72,13 @@ class CalculateBleu(chainer.training.Extension):
             references = []
             hypotheses = []
             for i in range(0, len(self.test_data), self.batch_size):
-                sources, targets = seq2seq_pad_concat_convert(
+                sources, source_t, targets = seq2seq_pad_concat_convert(
                     self.test_data[i:i + self.batch_size],
                     self.device
                 )
                 references.extend([[t.tolist()] for t in targets])
                 ys = [y.tolist() for y in self.model.translate(
-                      sources, self.max_length)]
+                      sources, source_t, self.max_length)]
                 hypotheses.extend(ys)
 
         bleu = bleu_score.corpus_bleu(
@@ -136,8 +142,8 @@ def load_data(vocabulary, path):
     return data
 
 
-def calculate_unknown_ratio(data):
-    unknown = sum((s == UNK).sum() for s in data)
+def calculate_unknown_ratio(data, unk_threshold):
+    unknown = sum((s >= unk_threshold).sum() for s in data)
     total = sum(s.size for s in data)
     return unknown / total
 
@@ -196,18 +202,23 @@ def main():
 
     train_source = load_data(source_ids_with_unks, args.SOURCE)
     train_target = load_data(target_ids_with_unks, args.TARGET)
+    # train source represented by target-side dictionary indices
+    train_source_t = load_data(target_ids_with_unks, args.SOURCE)
     assert len(train_source) == len(train_target)
-    train_data = [(s, t)
-                  for s, t in six.moves.zip(train_source, train_target)
+    train_data = [(s, st, t)
+                  for s, st, t
+                  in six.moves.zip(train_source, train_source_t, train_target)
                   if args.min_source_sentence <= len(s)
                   <= args.max_source_sentence and
                   args.min_source_sentence <= len(t)
                   <= args.max_source_sentence]
     train_source_unk = calculate_unknown_ratio(
-        [s for s, _ in train_data]
+        [s for s, _, _ in train_data],
+        len(source_ids)
     )
     train_target_unk = calculate_unknown_ratio(
-        [t for _, t in train_data]
+        [t for _, _, t in train_data],
+        len(target_ids)
     )
 
     print('Source vocabulary size: {}'.format(len(source_ids)))
@@ -216,12 +227,15 @@ def main():
     print('Train source unknown: {0:.2f}'.format(train_source_unk))
     print('Train target unknown: {0:.2f}'.format(train_target_unk))
 
-    target_words = {i: w for w, i in target_ids.items()}
-    source_words = {i: w for w, i in source_ids.items()}
+    source_words = {i: w for w, i in source_ids_with_unks.items()}
+    target_words = {i: w for w, i in target_ids_with_unks.items()}
 
-    model = Seq2seq(len(source_ids), len(target_ids), args.encoder_layer,
-                    args.encoder_unit, args.encoder_dropout,
-                    args.decoder_unit, args.attention_unit, args.maxout_unit)
+    model = Seq2seq(
+        len(source_ids), len(target_ids), len(target_ids_with_unks),
+        args.encoder_layer, args.encoder_unit,
+        args.encoder_dropout, args.decoder_unit,
+        args.attention_unit, args.maxout_unit
+    )
     if args.gpu >= 0:
         chainer.cuda.get_device(args.gpu).use()
         model.to_gpu(args.gpu)
@@ -250,14 +264,20 @@ def main():
     if args.validation_source and args.validation_target:
         test_source = load_data(source_ids, args.validation_source)
         test_target = load_data(target_ids, args.validation_target)
+        test_source_t = load_data(target_ids_with_unks, args.validation_source)
         assert len(test_source) == len(test_target)
-        test_data = list(six.moves.zip(test_source, test_target))
-        test_data = [(s, t) for s, t in test_data if 0 < len(s) and 0 < len(t)]
+        test_data = list(
+            six.moves.zip(test_source, test_source_t, test_target)
+        )
+        test_data = [(s, st, t) for s, st, t in test_data
+                     if 0 < len(s) and 0 < len(t)]
         test_source_unk = calculate_unknown_ratio(
-            [s for s, _ in test_data]
+            [s for s, _, _ in test_data],
+            len(source_ids)
         )
         test_target_unk = calculate_unknown_ratio(
-            [t for _, t in test_data]
+            [t for _, _, t in test_data],
+            len(target_ids)
         )
 
         print('Validation data: {}'.format(len(test_data)))
@@ -266,11 +286,11 @@ def main():
 
         @chainer.training.make_extension()
         def translate(_):
-            source, target = seq2seq_pad_concat_convert(
+            source, source_t, target = seq2seq_pad_concat_convert(
                 [test_data[numpy.random.choice(len(test_data))]],
                 args.gpu
             )
-            result = model.translate(source)[0].reshape(1, -1)
+            result = model.translate(source, source_t)[0].reshape(1, -1)
 
             source, target, result = source[0], target[0], result[0]
 
@@ -286,13 +306,13 @@ def main():
             trigger=(args.validation_interval, 'iteration')
         )
 
-        trainer.extend(
-            CalculateBleu(
-                model, test_data, device=args.gpu,
-                key='validation/main/bleu'
-            ),
-            trigger=(args.validation_interval, 'iteration')
-        )
+        # trainer.extend(
+        #     CalculateBleu(
+        #         model, test_data, device=args.gpu,
+        #         key='validation/main/bleu'
+        #     ),
+        #     trigger=(args.validation_interval, 'iteration')
+        # )
 
     print('start training')
 

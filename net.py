@@ -20,9 +20,10 @@ def replace_unknown_tokens_with_unk_id(array, n_vocab):
 
 class Seq2seq(chainer.Chain):
 
-    def __init__(self, n_source_vocab, n_target_vocab,
+    def __init__(self, n_source_vocab, n_target_vocab, n_target_vocab_with_unk,
                  n_encoder_layers, n_encoder_units, n_encoder_dropout,
-                 n_decoder_units, n_attention_units, n_maxout_units):
+                 n_decoder_units, n_attention_units,
+                 n_maxout_units, n_maxout_pools=2):
         super(Seq2seq, self).__init__()
         with self.init_scope():
             self.encoder = Encoder(
@@ -33,18 +34,22 @@ class Seq2seq(chainer.Chain):
             )
             self.decoder = Decoder(
                 n_target_vocab,
+                n_target_vocab_with_unk,
                 n_decoder_units,
                 n_attention_units,
                 n_encoder_units * 2,  # because of bi-directional lstm
                 n_maxout_units,
+                n_maxout_pools
             )
 
-    def __call__(self, xs, ys):
+    def __call__(self, xs, txs, ys):
         """Calculate loss between outputs and ys.
 
         Args:
-            xs: Source sentences.
-            ys: Target sentences.
+            xs: Source sentences' word ids.
+            txs: Source sequences' word ids represented by target-side
+                vocabulary ids.
+            ys: Target sentences' word ids.
 
         Returns:
             loss: Cross-entoropy loss between outputs and ys.
@@ -53,7 +58,7 @@ class Seq2seq(chainer.Chain):
         batch_size = len(xs)
 
         hxs = self.encoder(xs)
-        os = self.decoder(ys, hxs)
+        os = self.decoder(ys, txs, hxs)
 
         concatenated_os = F.concat(os, axis=0)
         concatenated_ys = F.flatten(ys.T)
@@ -70,19 +75,21 @@ class Seq2seq(chainer.Chain):
         chainer.report({'perp': perp}, self)
         return loss
 
-    def translate(self, xs, max_length=100):
+    def translate(self, xs, txs, max_length=100):
         """Generate sentences based on xs.
 
         Args:
-            xs: Source sentences.
+            xs: Source sentences' word ids.
+            txs: Source sequences' word ids represented by target-side
+                vocabulary ids.
 
         Returns:
-            ys: Generated target sentences.
+            ys: Generated target sentences' word ids.
 
         """
         with chainer.no_backprop_mode(), chainer.using_config('train', False):
             hxs = self.encoder(xs)
-            ys = self.decoder.translate(hxs, max_length)
+            ys = self.decoder.translate(txs, hxs, max_length)
         return ys
 
 
@@ -91,7 +98,7 @@ class Encoder(chainer.Chain):
     def __init__(self, n_vocab, n_layers, n_units, dropout):
         super(Encoder, self).__init__()
         with self.init_scope():
-            self.embed_x = L.EmbedID(n_vocab, n_units, ignore_label=-1)
+            self.embed_x = L.EmbedID(n_vocab, n_units, ignore_label=PAD)
             self.bilstm = L.NStepBiLSTM(n_layers, n_units, n_units, dropout)
         self.n_vocab = n_vocab
 
@@ -110,8 +117,9 @@ class Encoder(chainer.Chain):
         sanitated = replace_unknown_tokens_with_unk_id(xs, self.n_vocab)
         exs = self.embed_x(sanitated)
         exs = F.separate(exs, axis=0)
-        masks = self.xp.vsplit(xs != -1, batch_size)
-        masked_exs = [ex[mask.reshape((-1, ))] for ex, mask in zip(exs, masks)]
+        masks = self.xp.vsplit(xs != PAD, batch_size)
+        masked_exs = [ex[mask.reshape((PAD, ))]
+                      for ex, mask in zip(exs, masks)]
 
         _, _, hxs = self.bilstm(None, None, masked_exs)
         hxs = F.pad_sequence(hxs, length=max_length, padding=0.0)
@@ -120,8 +128,8 @@ class Encoder(chainer.Chain):
 
 class Decoder(chainer.Chain):
 
-    def __init__(self, n_vocab, n_units, n_attention_units,
-                 n_encoder_output_units, n_maxout_units, n_maxout_pools=2):
+    def __init__(self, n_vocab, n_vocab_with_unk, n_units, n_attention_units,
+                 n_encoder_output_units, n_maxout_units, n_maxout_pools):
         super(Decoder, self).__init__()
         with self.init_scope():
             self.embed_y = L.EmbedID(n_vocab, n_units, ignore_label=-1)
@@ -140,17 +148,24 @@ class Decoder(chainer.Chain):
                 n_attention_units,
                 n_units
             )
+            self.pointer = PointerModule(
+                n_vocab_with_unk,
+                n_encoder_output_units,
+                n_units,
+            )
             self.bos_state = Parameter(
                 initializer=self.xp.random.randn(1, n_units).astype('f')
             )
         self.n_vocab = n_vocab
         self.n_units = n_units
 
-    def __call__(self, ys, hxs):
+    def __call__(self, ys, txs, hxs):
         """Calculate cross-entoropy loss between predictions and ys.
 
         Args:
-            ys: Target sequences.
+            ys: Target sequences' word ids.
+            txs: Source sequences' word ids represented by target-side
+                vocabulary ids.
             hxs: Hidden states for source sequences.
 
         Returns:
@@ -173,21 +188,27 @@ class Decoder(chainer.Chain):
         for y in self.xp.hsplit(ys, ys.shape[1]):
             y = replace_unknown_tokens_with_unk_id(y, self.n_vocab)
             y = y.reshape((batch_size, ))
-            context = compute_context(h)
+            context, attention = compute_context(h)
             concatenated = F.concat((previous_embedding, context))
 
             c, h = self.lstm(c, h, concatenated)
             concatenated = F.concat((concatenated, h))
             o = self.w(self.maxout(concatenated))
 
-            os.append(o)
+            pointed_o = self.pointer(
+                context, h, previous_embedding, txs, attention, o
+            )
+
+            os.append(pointed_o)
             previous_embedding = self.embed_y(y)
         return os
 
-    def translate(self, hxs, max_length):
+    def translate(self, txs, hxs, max_length):
         """Generate target sentences given hidden states of source sentences.
 
         Args:
+            txs: Source sequences' word ids represented by target-side
+                vocabulary ids.
             hxs: Hidden states for source sequences.
 
         Returns:
@@ -205,14 +226,17 @@ class Decoder(chainer.Chain):
 
         results = []
         for _ in range(max_length):
-            context = compute_context(h)
+            context, attention = compute_context(h)
             concatenated = F.concat((previous_embedding, context))
 
             c, h = self.lstm(c, h, concatenated)
             concatenated = F.concat((concatenated, h))
 
-            logit = self.w(self.maxout(concatenated))
-            y = F.reshape(F.argmax(logit, axis=1), (batch_size, ))
+            o = self.w(self.maxout(concatenated))
+            pointed_o = self.pointer(
+                context, h, previous_embedding, txs, attention, o
+            )
+            y = F.reshape(F.argmax(pointed_o, axis=1), (batch_size, ))
 
             results.append(y)
             previous_embedding = self.embed_y(
@@ -289,6 +313,60 @@ class AttentionModule(chainer.Chain):
                 F.batch_matmul(attention, hxs, transa=True),
                 (batch_size, encoder_output_size)
             )
-            return context
+            return context, attention
 
         return compute_context
+
+
+class PointerModule(chainer.Chain):
+
+    def __init__(self, n_vocab, n_encoder_output_units, n_decoder_units):
+        super(PointerModule, self).__init__()
+        with self.init_scope():
+            self.c = L.Linear(n_encoder_output_units, 1)
+            self.h = L.Linear(n_decoder_units, 1)
+            self.w = L.Linear(n_decoder_units, 1)
+        self.n_vocab = n_vocab
+
+    def __call__(self, context, state, embedding, txs, attentions, o):
+        """Returns a function that calculates context given decoder's state.
+
+        Args:
+            txs: Source sequences' word ids represented by target-side
+                vocabulary ids.
+            attentions: The attentions for source sequences.
+            os: Decoder's output.
+            pgen: Weight to balance the probability of generating words from
+                the vocabulary, versus copying words from the source text.
+
+        Returns:
+            A probability of output words.
+
+        """
+        batch_size, max_length = txs.shape
+
+        pgen = F.broadcast_to(
+            F.sigmoid(self.c(context) + self.h(state) + self.w(embedding)),
+            (batch_size, self.n_vocab)
+        )
+
+        txs_mask = self.xp.zeros((batch_size, max_length, self.n_vocab), 'f')
+        for i, tx in enumerate(self.xp.split(txs, batch_size)):
+            masked_tx = tx[tx != PAD]
+            txs_mask[i][self.xp.arange(masked_tx.shape[0]), masked_tx] = 1.0
+        pointer = F.softmax(
+            F.sum(
+                txs_mask * F.broadcast_to(
+                    F.reshape(
+                        attentions,
+                        (batch_size, max_length, 1)
+                    ),
+                    (batch_size, max_length, self.n_vocab)
+                ),
+                axis=1
+            )
+        )
+
+        generator = F.pad_sequence(F.softmax(o), length=self.n_vocab)
+
+        return (1.0 - pgen) * pointer + pgen * generator
