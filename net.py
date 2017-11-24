@@ -322,9 +322,12 @@ class PointerModule(chainer.Chain):
     def __init__(self, n_vocab, n_encoder_output_units, n_decoder_units):
         super(PointerModule, self).__init__()
         with self.init_scope():
-            self.c = L.Linear(n_encoder_output_units, 1)
-            self.h = L.Linear(n_decoder_units, 1)
-            self.w = L.Linear(n_decoder_units, 1)
+            self.c = L.Linear(n_encoder_output_units, 1, nobias=True)
+            self.h = L.Linear(n_decoder_units, 1, nobias=True)
+            self.w = L.Linear(n_decoder_units, 1, nobias=True)
+            self.b = Parameter(
+                initializer=self.xp.random.randn(1, ).astype('f')
+            )
         self.n_vocab = n_vocab
 
     def __call__(self, context, state, embedding, txs, attention, o):
@@ -345,7 +348,10 @@ class PointerModule(chainer.Chain):
         batch_size, max_length = txs.shape
 
         pgen = F.broadcast_to(
-            F.sigmoid(self.c(context) + self.h(state) + self.w(embedding)),
+            F.sigmoid(
+                self.c(context) + self.h(state) + self.w(embedding) +
+                F.broadcast_to(self.b, (batch_size, 1))
+            ),
             (batch_size, self.n_vocab)
         )
 
