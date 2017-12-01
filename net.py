@@ -23,7 +23,7 @@ class Seq2seq(chainer.Chain):
     def __init__(self, n_source_vocab, n_target_vocab, n_target_vocab_with_unk,
                  n_encoder_layers, n_encoder_units, n_encoder_dropout,
                  n_decoder_units, n_attention_units,
-                 n_maxout_units, n_maxout_pools=2):
+                 n_maxout_units, n_maxout_pools=2, lamb=1.0):
         super(Seq2seq, self).__init__()
         with self.init_scope():
             self.encoder = Encoder(
@@ -41,6 +41,7 @@ class Seq2seq(chainer.Chain):
                 n_maxout_units,
                 n_maxout_pools
             )
+        self.lamb = lamb
 
     def __call__(self, xs, txs, ys):
         """Calculate loss between outputs and ys.
@@ -55,8 +56,6 @@ class Seq2seq(chainer.Chain):
             loss: Cross-entoropy loss between outputs and ys.
 
         """
-        batch_size = len(xs)
-
         hxs = self.encoder(xs)
         os = self.decoder(ys, txs, hxs)
 
@@ -69,10 +68,8 @@ class Seq2seq(chainer.Chain):
                 concatenated_os, concatenated_ys, reduce='no', ignore_label=PAD
             )
         )
-        loss = loss / n_words
+        loss = (loss + self.decoder.get_coverage_loss() * self.lamb) / n_words
         chainer.report({'loss': loss.data}, self)
-        perp = self.xp.exp(loss.data * batch_size / n_words)
-        chainer.report({'perp': perp}, self)
         return loss
 
     def translate(self, xs, txs, max_length=100):
@@ -188,7 +185,7 @@ class Decoder(chainer.Chain):
         for y in self.xp.hsplit(ys, ys.shape[1]):
             y = replace_unknown_tokens_with_unk_id(y, self.n_vocab)
             y = y.reshape((batch_size, ))
-            context, attention = compute_context(h)
+            context, attention = compute_context(h, y)
             concatenated = F.concat((previous_embedding, context))
 
             c, h = self.lstm(c, h, concatenated)
@@ -220,13 +217,12 @@ class Decoder(chainer.Chain):
         c = Variable(self.xp.zeros((batch_size, self.n_units), 'f'))
         h = F.broadcast_to(self.bos_state, ((batch_size, self.n_units)))
         # first character's embedding
-        previous_embedding = self.embed_y(
-            Variable(self.xp.full((batch_size, ), EOS, 'i'))
-        )
+        y = Variable(self.xp.full((batch_size, ), EOS, 'i'))
+        previous_embedding = self.embed_y(y)
 
         results = []
         for _ in range(max_length):
-            context, attention = compute_context(h)
+            context, attention = compute_context(h, y.data)
             concatenated = F.concat((previous_embedding, context))
 
             c, h = self.lstm(c, h, concatenated)
@@ -253,6 +249,9 @@ class Decoder(chainer.Chain):
             ys.append(result.data)
         return ys
 
+    def get_coverage_loss(self):
+        return self.attention.get_coverage_loss()
+
 
 class AttentionModule(chainer.Chain):
 
@@ -263,6 +262,7 @@ class AttentionModule(chainer.Chain):
             self.h = L.Linear(n_encoder_output_units, n_attention_units)
             self.s = L.Linear(n_decoder_units, n_attention_units)
             self.o = L.Linear(n_attention_units, 1)
+            self.wc = L.Linear(1, n_attention_units)
         self.n_encoder_output_units = n_encoder_output_units
         self.n_attention_units = n_attention_units
 
@@ -288,25 +288,54 @@ class AttentionModule(chainer.Chain):
             (batch_size, max_length, self.n_attention_units)
         )
         mask_for_attention = xs.copy().astype('f')
-        mask_for_attention[mask_for_attention >= 0] = 0
-        mask_for_attention[mask_for_attention < 0] = -float('inf')
+        mask_for_attention[mask_for_attention != PAD] = 0
+        mask_for_attention[mask_for_attention == PAD] = -float('inf')
 
-        def compute_context(previous_state):
+        self.cumulative_attention = Variable(
+            self.xp.zeros((batch_size, max_length), 'f')
+        )
+        self.coverage_loss = Variable(self.xp.array(0, 'f'))
+
+        def compute_context(previous_state, y):
             decoder_factor = F.broadcast_to(
                 self.s(previous_state)[:, None, :],
                 (batch_size, max_length, self.n_attention_units)
             )
 
+            ca_factor = F.reshape(
+                self.wc(
+                    F.reshape(
+                        self.cumulative_attention,
+                        (batch_size * max_length, 1)
+                    )
+                ),
+                (batch_size, max_length, self.n_attention_units)
+            )
+
+            mask_for_cut = self.xp.broadcast_to(
+                y.copy().astype('f')[:, None],
+                (batch_size, max_length)
+            )
+            mask_for_cut[mask_for_cut != PAD] = 1
+            mask_for_cut[mask_for_cut == PAD] = 0
+
             attention = F.reshape(
                 self.o(
                     F.reshape(
-                        F.tanh(encoder_factor + decoder_factor),
+                        F.tanh(encoder_factor + decoder_factor + ca_factor),
                         (batch_size * max_length, self.n_attention_units)
                     )
                 ),
                 (batch_size, max_length)
             )
             masked_attention = F.softmax(mask_for_attention + attention)
+            masked_attention *= mask_for_cut  # set 0 if y is PAD
+
+            self.cumulative_attention += masked_attention
+            self.coverage_loss += F.sum(
+                mask_for_cut *
+                F.minimum(self.cumulative_attention, masked_attention)
+            )
 
             context = F.reshape(
                 F.batch_matmul(masked_attention, hxs, transa=True),
@@ -315,6 +344,9 @@ class AttentionModule(chainer.Chain):
             return context, masked_attention
 
         return compute_context
+
+    def get_coverage_loss(self):
+        return self.coverage_loss
 
 
 class PointerModule(chainer.Chain):
