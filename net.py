@@ -15,6 +15,19 @@ def replace_unknown_tokens_with_unk_id(array, n_vocab):
     return ret
 
 
+def cross_entropy(ys, ts, reduce='mean', ignore_label=None, eps=1e-6):
+    if isinstance(ts, Variable):
+        ts = ts.data
+
+    loss = -F.log(F.select_item(ys, ts) + eps)
+    if ignore_label is not None:
+        in_use = (ts != ignore_label).astype(ys.dtype)
+        loss = loss * in_use
+    if reduce == 'mean':
+        loss = F.mean(loss)
+    return loss
+
+
 class Seq2seq(chainer.Chain):
 
     def __init__(self, n_source_vocab, n_target_vocab, n_target_vocab_with_unk,
@@ -61,7 +74,7 @@ class Seq2seq(chainer.Chain):
         n_words = len(self.xp.where(concatenated_ys.data != EOS)[0])
 
         loss = F.sum(
-            F.softmax_cross_entropy(
+            cross_entropy(
                 concatenated_os, concatenated_ys, reduce='no', ignore_label=PAD
             )
         )
