@@ -1,15 +1,12 @@
 """Pointer Generator Network model."""
-import numpy as np
-
 import chainer
 from chainer import Variable
 from chainer import Parameter
 import chainer.functions as F
 import chainer.links as L
 
-PAD = -1
-UNK = 0
-EOS = 1
+from utils import PAD, UNK, EOS
+from utils import get_subsequence_before_eos
 
 
 def replace_unknown_tokens_with_unk_id(array, n_vocab):
@@ -241,12 +238,7 @@ class Decoder(chainer.Chain):
         else:
             results = F.separate(F.transpose(F.vstack(results)), axis=0)
 
-        ys = []
-        for result in results:
-            index = np.argwhere(result.data == EOS)
-            if len(index) > 0:
-                result = result[:index[0, 0] + 1]
-            ys.append(result.data)
+        ys = [get_subsequence_before_eos(result.data) for result in results]
         return ys
 
     def get_coverage_loss(self):
