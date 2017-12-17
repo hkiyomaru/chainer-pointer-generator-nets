@@ -1,21 +1,31 @@
 """Pointer Generator Network model."""
-import numpy as np
-
 import chainer
 from chainer import Variable
 from chainer import Parameter
 import chainer.functions as F
 import chainer.links as L
 
-PAD = -1
-UNK = 0
-EOS = 1
+from utils import PAD, UNK, EOS
+from utils import get_subsequence_before_eos
 
 
 def replace_unknown_tokens_with_unk_id(array, n_vocab):
     ret = array.copy()
     ret[ret >= n_vocab] = UNK
     return ret
+
+
+def cross_entropy(ys, ts, reduce='mean', ignore_label=None, eps=1e-6):
+    if isinstance(ts, Variable):
+        ts = ts.data
+
+    loss = -F.log(F.select_item(ys, ts) + eps)
+    if ignore_label is not None:
+        in_use = (ts != ignore_label).astype(ys.dtype)
+        loss = loss * in_use
+    if reduce == 'mean':
+        loss = F.mean(loss)
+    return loss
 
 
 class Seq2seq(chainer.Chain):
@@ -64,7 +74,7 @@ class Seq2seq(chainer.Chain):
         n_words = len(self.xp.where(concatenated_ys.data != EOS)[0])
 
         loss = F.sum(
-            F.softmax_cross_entropy(
+            cross_entropy(
                 concatenated_os, concatenated_ys, reduce='no', ignore_label=PAD
             )
         )
@@ -241,12 +251,7 @@ class Decoder(chainer.Chain):
         else:
             results = F.separate(F.transpose(F.vstack(results)), axis=0)
 
-        ys = []
-        for result in results:
-            index = np.argwhere(result.data == EOS)
-            if len(index) > 0:
-                result = result[:index[0, 0] + 1]
-            ys.append(result.data)
+        ys = [get_subsequence_before_eos(result.data) for result in results]
         return ys
 
     def get_coverage_loss(self):
