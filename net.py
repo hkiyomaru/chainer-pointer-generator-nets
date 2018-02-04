@@ -15,7 +15,7 @@ def replace_unknown_tokens_with_unk_id(array, n_vocab):
     return ret
 
 
-def cross_entropy(ys, ts, reduce='mean', ignore_label=None, eps=1e-6):
+def cross_entropy(ys, ts, reduce='mean', ignore_label=None, eps=1e-10):
     if isinstance(ts, Variable):
         ts = ts.data
 
@@ -71,7 +71,7 @@ class Seq2seq(chainer.Chain):
 
         concatenated_os = F.concat(os, axis=0)
         concatenated_ys = F.flatten(ys.T)
-        n_words = len(self.xp.where(concatenated_ys.data != EOS)[0])
+        n_words = len(self.xp.where(concatenated_ys.data != PAD)[0])
 
         loss = F.sum(
             cross_entropy(
@@ -105,8 +105,17 @@ class Encoder(chainer.Chain):
     def __init__(self, n_vocab, n_layers, n_units, dropout):
         super(Encoder, self).__init__()
         with self.init_scope():
-            self.embed_x = L.EmbedID(n_vocab, n_units, ignore_label=PAD)
-            self.bilstm = L.NStepBiLSTM(n_layers, n_units, n_units, dropout)
+            self.embed_x = L.EmbedID(
+                n_vocab,
+                n_units,
+                ignore_label=PAD
+            )
+            self.bilstm = L.NStepBiLSTM(
+                n_layers,
+                n_units,
+                n_units,
+                dropout
+            )
         self.n_vocab = n_vocab
 
     def __call__(self, xs):
@@ -139,7 +148,11 @@ class Decoder(chainer.Chain):
                  n_encoder_output_units, n_maxout_units, n_maxout_pools):
         super(Decoder, self).__init__()
         with self.init_scope():
-            self.embed_y = L.EmbedID(n_vocab, n_units, ignore_label=-1)
+            self.embed_y = L.EmbedID(
+                n_vocab,
+                n_units,
+                ignore_label=-1
+            )
             self.lstm = L.StatelessLSTM(
                 n_units + n_encoder_output_units,
                 n_units
@@ -149,7 +162,10 @@ class Decoder(chainer.Chain):
                 n_maxout_units,
                 n_maxout_pools
             )
-            self.w = L.Linear(n_units, n_vocab)
+            self.w = L.Linear(
+                n_maxout_units,
+                n_vocab
+            )
             self.attention = AttentionModule(
                 n_encoder_output_units,
                 n_attention_units,
@@ -264,10 +280,22 @@ class AttentionModule(chainer.Chain):
                  n_attention_units, n_decoder_units):
         super(AttentionModule, self).__init__()
         with self.init_scope():
-            self.h = L.Linear(n_encoder_output_units, n_attention_units)
-            self.s = L.Linear(n_decoder_units, n_attention_units)
-            self.o = L.Linear(n_attention_units, 1)
-            self.wc = L.Linear(1, n_attention_units)
+            self.h = L.Linear(
+                n_encoder_output_units,
+                n_attention_units
+            )
+            self.s = L.Linear(
+                n_decoder_units,
+                n_attention_units
+            )
+            self.o = L.Linear(
+                n_attention_units,
+                1
+            )
+            self.wc = L.Linear(
+                1,
+                n_attention_units
+            )
         self.n_encoder_output_units = n_encoder_output_units
         self.n_attention_units = n_attention_units
 
@@ -359,9 +387,21 @@ class PointerModule(chainer.Chain):
     def __init__(self, n_vocab, n_encoder_output_units, n_decoder_units):
         super(PointerModule, self).__init__()
         with self.init_scope():
-            self.c = L.Linear(n_encoder_output_units, 1, nobias=True)
-            self.h = L.Linear(n_decoder_units, 1, nobias=True)
-            self.w = L.Linear(n_decoder_units, 1, nobias=True)
+            self.c = L.Linear(
+                n_encoder_output_units,
+                1,
+                nobias=True
+            )
+            self.h = L.Linear(
+                n_decoder_units,
+                1,
+                nobias=True
+            )
+            self.w = L.Linear(
+                n_decoder_units,
+                1,
+                nobias=True
+            )
             self.b = Parameter(
                 initializer=self.xp.random.randn(1, ).astype('f')
             )
